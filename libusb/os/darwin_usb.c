@@ -99,6 +99,7 @@ static enum libusb_error darwin_get_cached_device(struct libusb_context *ctx, io
                                                   UInt64 *old_session_id);
 
 static int darwin_detach_kernel_driver (struct libusb_device_handle *dev_handle, uint8_t interface);
+static int _darwin_detach_kernel_driver_locked (struct libusb_device_handle *dev_handle, uint8_t interface);
 
 #if defined(ENABLE_LOGGING)
 static const char *darwin_error_str (IOReturn result) {
@@ -188,6 +189,7 @@ static void darwin_deref_cached_device(struct darwin_cached_device *cached_dev) 
       cached_dev->device = NULL;
     }
     IOObjectRelease (cached_dev->service);
+    usbi_mutex_destroy (&cached_dev->capture_mutex);
     free (cached_dev);
   }
 }
@@ -1079,6 +1081,9 @@ static enum libusb_error darwin_get_cached_device(struct libusb_context *ctx, io
       (*device)->GetLocationID (device, &new_device->location);
       new_device->port = port;
       new_device->parent_session = parent_sessionID;
+
+      /* initialize locks */
+      usbi_mutex_init (&new_device->capture_mutex);
     } else {
       /* release the ref to old device's service */
       IOObjectRelease (new_device->service);
@@ -1759,6 +1764,7 @@ static int darwin_restore_state (struct libusb_device_handle *dev_handle, int8_t
   return LIBUSB_SUCCESS;
 }
 
+/* call holding capture_mutex lock */
 static int darwin_reenumerate_device (struct libusb_device_handle *dev_handle, bool capture) {
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   unsigned long claimed_interfaces = dev_handle->claimed_interfaces;
@@ -1856,7 +1862,8 @@ static int darwin_reenumerate_device (struct libusb_device_handle *dev_handle, b
   return darwin_restore_state (dev_handle, active_config, claimed_interfaces);
 }
 
-static int darwin_reset_device (struct libusb_device_handle *dev_handle) {
+/* call holding capture_mutex lock */
+static int _darwin_reset_device_locked (struct libusb_device_handle *dev_handle) {
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   unsigned long claimed_interfaces = dev_handle->claimed_interfaces;
   int8_t active_config = dpriv->active_config;
@@ -1879,7 +1886,7 @@ static int darwin_reset_device (struct libusb_device_handle *dev_handle) {
     /* reset capture count */
     dpriv->capture_count = 0;
     /* attempt to detach kernel driver again as it is now re-attached */
-    ret = darwin_detach_kernel_driver (dev_handle, 0);
+    ret = _darwin_detach_kernel_driver_locked (dev_handle, 0);
     if (ret != LIBUSB_SUCCESS) {
       return ret;
     }
@@ -1888,6 +1895,16 @@ static int darwin_reset_device (struct libusb_device_handle *dev_handle) {
     /* restore configuration */
     ret = darwin_restore_state (dev_handle, active_config, claimed_interfaces);
   }
+  return ret;
+}
+
+static int darwin_reset_device (struct libusb_device_handle *dev_handle) {
+  struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
+  enum libusb_error ret;
+
+  usbi_mutex_lock (&dpriv->capture_mutex);
+  ret = _darwin_reset_device_locked (dev_handle);
+  usbi_mutex_unlock (&dpriv->capture_mutex);
   return ret;
 }
 
@@ -2502,7 +2519,8 @@ static int darwin_reload_device (struct libusb_device_handle *dev_handle) {
 
 /* On macOS, we capture an entire device at once, not individual interfaces. */
 
-static int darwin_detach_kernel_driver (struct libusb_device_handle *dev_handle, uint8_t interface) {
+/* call holding capture_mutex lock */
+static int _darwin_detach_kernel_driver_locked (struct libusb_device_handle *dev_handle, uint8_t interface) {
   UNUSED(interface);
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   IOReturn kresult;
@@ -2548,8 +2566,18 @@ static int darwin_detach_kernel_driver (struct libusb_device_handle *dev_handle,
   return LIBUSB_SUCCESS;
 }
 
+static int darwin_detach_kernel_driver (struct libusb_device_handle *dev_handle, uint8_t interface) {
+  struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
+  enum libusb_error ret;
 
-static int darwin_attach_kernel_driver (struct libusb_device_handle *dev_handle, uint8_t interface) {
+  usbi_mutex_lock (&dpriv->capture_mutex);
+  ret = _darwin_detach_kernel_driver_locked (dev_handle, interface);
+  usbi_mutex_unlock (&dpriv->capture_mutex);
+  return ret;
+}
+
+/* call holding capture_mutex lock */
+static int _darwin_attach_kernel_driver_locked (struct libusb_device_handle *dev_handle, uint8_t interface) {
   UNUSED(interface);
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
 
@@ -2569,6 +2597,16 @@ static int darwin_attach_kernel_driver (struct libusb_device_handle *dev_handle,
   return darwin_reenumerate_device (dev_handle, false);
 }
 
+static int darwin_attach_kernel_driver (struct libusb_device_handle *dev_handle, uint8_t interface) {
+  struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
+  enum libusb_error ret;
+
+  usbi_mutex_lock (&dpriv->capture_mutex);
+  ret = _darwin_attach_kernel_driver_locked (dev_handle, interface);
+  usbi_mutex_unlock (&dpriv->capture_mutex);
+  return ret;
+}
+
 static int darwin_capture_claim_interface(struct libusb_device_handle *dev_handle, uint8_t iface) {
   enum libusb_error ret;
   if (dev_handle->auto_detach_kernel_driver && darwin_kernel_driver_active(dev_handle, iface)) {
@@ -2581,7 +2619,8 @@ static int darwin_capture_claim_interface(struct libusb_device_handle *dev_handl
   return darwin_claim_interface (dev_handle, iface);
 }
 
-static int darwin_capture_release_interface(struct libusb_device_handle *dev_handle, uint8_t iface) {
+/* call holding capture_mutex lock */
+static int _darwin_capture_release_interface_locked(struct libusb_device_handle *dev_handle, uint8_t iface) {
   enum libusb_error ret;
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
 
@@ -2591,7 +2630,7 @@ static int darwin_capture_release_interface(struct libusb_device_handle *dev_han
   }
 
   if (dev_handle->auto_detach_kernel_driver && dpriv->capture_count > 0) {
-    ret = darwin_attach_kernel_driver (dev_handle, iface);
+    ret = _darwin_attach_kernel_driver_locked (dev_handle, iface);
     if (LIBUSB_SUCCESS != ret) {
       usbi_info (HANDLE_CTX (dev_handle), "on attempt to reattach the kernel driver got ret=%d", ret);
     }
@@ -2599,6 +2638,16 @@ static int darwin_capture_release_interface(struct libusb_device_handle *dev_han
   }
 
   return LIBUSB_SUCCESS;
+}
+
+static int darwin_capture_release_interface (struct libusb_device_handle *dev_handle, uint8_t iface) {
+  struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
+  enum libusb_error ret;
+
+  usbi_mutex_lock (&dpriv->capture_mutex);
+  ret = _darwin_capture_release_interface_locked (dev_handle, iface);
+  usbi_mutex_unlock (&dpriv->capture_mutex);
+  return ret;
 }
 
 #endif
