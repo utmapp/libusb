@@ -2540,13 +2540,15 @@ static bool darwin_has_capture_entitlements (void) {
 static int darwin_reload_device (struct libusb_device_handle *dev_handle) {
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   enum libusb_error err;
+  usb_device_t **new_device;
 
   usbi_mutex_lock(&darwin_cached_devices_mutex);
-  (*(dpriv->device))->Release(dpriv->device);
-  dpriv->device = darwin_device_from_service (HANDLE_CTX (dev_handle), dpriv->service);
-  if (!dpriv->device) {
+  new_device = darwin_device_from_service (HANDLE_CTX (dev_handle), dpriv->service);
+  if (!new_device) {
     err = LIBUSB_ERROR_NO_DEVICE;
   } else {
+    (*(dpriv->device))->Release(dpriv->device);
+    dpriv->device = new_device;
     err = LIBUSB_SUCCESS;
   }
   usbi_mutex_unlock(&darwin_cached_devices_mutex);
