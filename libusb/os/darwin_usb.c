@@ -2329,6 +2329,7 @@ static int darwin_cancel_transfer(struct usbi_transfer *itransfer) {
   case LIBUSB_TRANSFER_TYPE_BULK:
   case LIBUSB_TRANSFER_TYPE_INTERRUPT:
   case LIBUSB_TRANSFER_TYPE_ISOCHRONOUS:
+  case LIBUSB_TRANSFER_TYPE_BULK_STREAM:
     return darwin_abort_transfers (itransfer);
   default:
     usbi_err (TRANSFER_CTX(transfer), "unknown endpoint type %d", transfer->type);
